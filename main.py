@@ -1,27 +1,13 @@
 """FastAPI application entry point."""
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 
-from app.database import Base, engine
 from app.routes.shorten import router as shorten_router
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create tables on startup.
-
-    Dev convenience only. In production, schema changes should go through
-    Alembic migrations instead of create_all(), so changes are versioned and
-    reviewable rather than silently applied on every boot.
-    """
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-
-
-app = FastAPI(title="URL Shortener", version="1.0.0", lifespan=lifespan)
+# Schema is owned by Alembic (see migrations/), not by the app at startup:
+# run `alembic upgrade head` to create/update tables. No create_all() call
+# here on purpose -- that would apply schema changes silently on every boot
+# instead of via versioned, reviewable migrations.
+app = FastAPI(title="URL Shortener", version="1.0.0")
 
 
 @app.get("/health")

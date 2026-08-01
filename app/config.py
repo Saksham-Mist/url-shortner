@@ -2,7 +2,7 @@
 import re
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,5 +44,35 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return a process-wide cached Settings instance so .env is only parsed once."""
-    return Settings()
+    """Return a process-wide cached Settings instance so .env is only parsed once.
+
+    Deliberately still fails immediately at first call (import time, via
+    database.py's module-level `settings = get_settings()`) if DATABASE_URL
+    is missing, rather than deferring validation until a request tries to
+    use the DB. A required secret with no sane default should crash loudly
+    at boot, not accept traffic and fail unpredictably on the first query --
+    and on Railway (or any container platform), env vars are injected before
+    the process starts, so "missing at import time" and "missing five
+    minutes later" are the same failure, not a race. This wrapper only
+    replaces pydantic's generic ValidationError with a message that says
+    what to actually go check.
+    """
+    try:
+        return Settings()
+    except ValidationError as exc:
+        missing_fields = {
+            str(error["loc"][0]) for error in exc.errors() if error["type"] == "missing"
+        }
+        if "raw_database_url" in missing_fields or "DATABASE_URL" in missing_fields:
+            raise RuntimeError(
+                "DATABASE_URL is not set in this environment. On Railway this "
+                "is almost always a configuration gap, not a startup-timing "
+                "issue -- env vars are injected before your process starts. "
+                "Check: (1) Railway dashboard -> this service -> Variables "
+                "tab actually has DATABASE_URL (Railway only auto-populates "
+                "it for its own managed Postgres plugin -- an external DB "
+                "like Neon must be added manually), (2) it's set on *this* "
+                "service/environment and not a different one in the project, "
+                "(3) you redeployed after adding it."
+            ) from exc
+        raise
