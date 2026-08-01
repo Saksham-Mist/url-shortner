@@ -2,7 +2,7 @@
 
 A production-style URL shortener built with FastAPI, async SQLAlchemy, and PostgreSQL (Neon). Given a long URL, it returns a short code that 302-redirects to the original and logs every click for analytics — total clicks, clicks per day, and top referrers.
 
-Built as a learning project to go deep on things that are easy to hand-wave in a tutorial and hard to fake in an interview: collision-free ID generation, why redirects use 302 instead of 301, async session handling with background tasks, and schema migrations with Alembic.
+Built as a learning project to go deep on things that are easy to hand-wave in a tutorial: collision-free ID generation, why redirects use 302 instead of 301, async session handling with background tasks, and schema migrations with Alembic.
 
 ## Features
 
@@ -10,7 +10,7 @@ Built as a learning project to go deep on things that are easy to hand-wave in a
 - **Redirect + click tracking** — `GET /{shortCode}` 302-redirects to the original URL and logs the click (referrer, user agent, IP, timestamp) without adding latency to the redirect itself.
 - **Analytics** — `GET /api/v1/stats/{shortCode}` returns total clicks, a day-by-day breakdown, and the top referring sources for a given code.
 - **Health check** — `GET /health` for uptime monitors / load balancers.
-- **Collision-free codes** — short codes are derived from the database's own row sequence, not randomly generated, so there's no retry-on-collision logic anywhere (see [Interview Talking Points](#interview-talking-points)).
+- **Collision-free codes** — short codes are derived from the database's own row sequence, not randomly generated, so there's no retry-on-collision logic anywhere (see [What I Learned](#what-i-learned)).
 - **Schema-versioned** — every table change goes through an Alembic migration, not an app-level `create_all()`.
 
 ## Tech Stack
@@ -190,7 +190,7 @@ curl http://localhost:8000/health
 The project uses [Neon](https://neon.tech) — serverless Postgres with a generous free tier, good for a portfolio project since it doesn't need to run 24/7. Two Postgres-specific things the schema relies on (worth knowing, since a from-scratch SQLite swap wouldn't work here):
 
 - **`INET`** column type for `clicks.ip_address` (native IP address type, not just a string).
-- **`nextval('urls_id_seq')`** called directly in `shortener_service.create_short_url()` to get a row's id *before* inserting, so the derived short code can be written in the same `INSERT` as the row itself (see [Interview Talking Points](#interview-talking-points)).
+- **`nextval('urls_id_seq')`** called directly in `shortener_service.create_short_url()` to get a row's id *before* inserting, so the derived short code can be written in the same `INSERT` as the row itself (see [What I Learned](#what-i-learned)).
 
 **One connection-string wrinkle worth understanding**: Neon's connection string uses `sslmode=require`, a `libpq`/`psycopg2` convention. `asyncpg` (the async driver this project uses) doesn't understand `sslmode` as a query parameter at all — leaving it in the URL raises a connect error. `app/config.py` strips it and rewrites the URL:
 
@@ -233,32 +233,21 @@ On a fresh database (new teammate, CI, or a new deploy), `alembic upgrade head` 
 
 ## What I Learned
 
-Concepts I went deep on that a copy-pasted tutorial wouldn't have forced me to understand:
+### Concepts
 
 - **Async all the way down, or not at all.** Using `async def` routes with a blocking DB driver would've silently defeated the whole point of async — one blocking call stalls FastAPI's *entire* event loop, not just that request.
 - **A `BackgroundTasks` function can't safely reuse the request's DB session.** By the time a background task runs (after the response is already sent), the request-scoped session from `Depends(get_db)` may already be closed. `record_click()` opens its own session via `async_session_factory()` instead — I hit this as a real bug, not a hypothetical.
+- **Collision-free short codes don't require a retry loop.** Two designs exist for generating short codes: (a) random string + retry on a `UNIQUE` violation, or (b) derive the code from a value that's already guaranteed unique. I went with (b): each code is a Base62 encoding of a *permutation* of the row's own database-sequence id (`urls_id_seq`). The permutation multiplier is coprime with the code space (`62**7`), which makes `id -> code` a bijection — so two different ids can never produce the same code, which is a stronger guarantee than "collisions are improbable." A raw sequential id would leak signup volume/order, which is why it's permuted before encoding rather than encoded directly.
+- **Why redirects use 302, not 301.** A `301 Moved Permanently` gets cached by browsers indefinitely — the browser stops hitting the server on repeat visits. That breaks click analytics (every returning visitor goes uncounted) and the ability to deactivate or repoint a link later (a cached 301 can't be revoked). `302 Found` tells the browser "check with me every time," which is the only choice compatible with tracking every click.
 - **Autogenerate is a diff tool, not a from-scratch generator.** The first time I ran `alembic revision --autogenerate`, it produced a near-empty migration — because it diffs against the *actual live database*, and my tables already existed from an earlier `create_all()` call. Getting a genuine "creates everything" initial migration required generating it against an actually-empty database.
+
+### Debugging Process
+
+- **Route registration order silently broke `/health`.** `GET /{shortCode}` is a catch-all for any single path segment. When it was registered *before* `GET /health` in `main.py`, a request to `/health` matched the catch-all instead — FastAPI/Starlette match routes in registration order, not by specificity, so `"health"` was treated as a short code and returned 404. Fixed by declaring `/health` first. This one only surfaced because I actually curl'd the running app instead of trusting the code by inspection.
+- **Schema drift between "what `create_all()` built" and "what the models declare."** The live database's `urls` table enforced uniqueness on `short_code` via a table constraint named `uq_urls_short_code` (from early raw SQL), while the SQLAlchemy model declared a separately-named index (`ix_urls_short_code`, SQLAlchemy's default naming). Functionally identical, but Alembic's `--autogenerate` flagged it as drift. Also caused a `NotNullViolationError`: an early service design tried a two-phase insert (insert row, then set `short_code` after learning the new row's id), which needs a `NULL` in between — but the live table already had `short_code NOT NULL`. Redesigned to pull `nextval('urls_id_seq')` *before* inserting, so `id` and `short_code` are written together in a single `INSERT` — one round trip instead of two, and no schema relaxation needed.
+- **`pytest-asyncio`'s default event loop breaks a module-level async engine.** `pytest-asyncio` creates a *new* event loop per test function by default. But `app/database.py`'s `engine` is a single object created once at import time — its pooled connections bind to whichever event loop touches them first, then raise `RuntimeError: Event loop is closed` on the next test's fresh loop. Fixed with `asyncio_default_fixture_loop_scope = session` in `pytest.ini`, so the whole test run shares one loop — matching how a real running app only ever has one.
 - **`.gitignore` has to be plain text.** Mine had been silently UTF-16-encoded (likely from a Windows editor save) since the start of the project — `git check-ignore` proved it was matching *nothing*, meaning `.env` was never actually protected. This is almost certainly what caused the credential-rotation incident early in this repo's history (see commit `ee7fa53`). Fixed by re-writing the file as plain UTF-8 and verifying with `git check-ignore -v .env`.
 - **Environment variables aren't a race condition on container platforms.** When Railway couldn't find `DATABASE_URL`, my first instinct was "the app started before the env var loaded." That's not how containers work — the platform injects env vars *before* your process starts. The real cause was that Railway only auto-populates `DATABASE_URL` for its own managed Postgres plugin; an external database like Neon has to be added as a variable manually.
-
-## Interview Talking Points
-
-Real bugs, found by actually running the code against a live database rather than assuming it worked — each one is a decent interview story on its own.
-
-**1. Collision-free short codes, without a retry loop.**
-Two designs exist for generating short codes: (a) random string + retry on a `UNIQUE` violation, or (b) derive the code from a value that's already guaranteed unique. I chose (b): each code is a Base62 encoding of a *permutation* of the row's own database-sequence id (`urls_id_seq`). The permutation multiplier is coprime with the code space (`62**7`), which makes `id -> code` a bijection — so two different ids can *never* produce the same code. That's a stronger guarantee than "collisions are improbable," and it's why there's no retry logic anywhere in `shortener_service.py`. Trade-off I'd defend: a raw sequential id would leak signup volume/order, which is why it's permuted before encoding rather than encoded directly.
-
-**2. 302, not 301, for the redirect — and why it matters more than it looks.**
-A `301 Moved Permanently` gets cached by browsers indefinitely — the browser stops hitting your server on repeat visits. That breaks two requirements at once: click analytics (you'd undercount every returning visitor) and the ability to deactivate or repoint a link later (a cached 301 can't be revoked). `302 Found` tells the browser "check with me every time," which is the only choice compatible with tracking every click.
-
-**3. Route registration order silently broke `/health`.**
-`GET /{shortCode}` is a catch-all for any single path segment. When it was registered *before* `GET /health` in `main.py`, a request to `/health` matched the catch-all instead — FastAPI/Starlette match routes in registration order, not by specificity, so `"health"` was treated as a short code and returned 404. Fixed by declaring `/health` first. This one only showed up because I actually curl'd the running app instead of trusting the code by inspection.
-
-**4. Schema drift between "what create_all() built" and "what the models declare."**
-The live database's `urls` table enforced uniqueness on `short_code` via a table constraint named `uq_urls_short_code` (from early raw SQL), while the SQLAlchemy model declared a separately-named index (`ix_urls_short_code`, SQLAlchemy's default naming). Functionally identical, but Alembic's `--autogenerate` flagged it as drift. Also caused a `NotNullViolationError`: an early service design tried a two-phase insert (insert row, then set `short_code` after learning the new row's id), which needs a `NULL` in between — but the live table already had `short_code NOT NULL`. Redesigned to pull `nextval('urls_id_seq')` *before* inserting, so `id` and `short_code` are written together in a single `INSERT` — one round trip instead of two, and no schema relaxation needed.
-
-**5. `pytest-asyncio`'s default event loop breaks a module-level async engine.**
-`pytest-asyncio` creates a *new* event loop per test function by default. But `app/database.py`'s `engine` is a single object created once at import time — its pooled connections bind to whichever event loop touches them first, then raise `RuntimeError: Event loop is closed` on the next test's fresh loop. Fixed with `asyncio_default_fixture_loop_scope = session` in `pytest.ini`, so the whole test run shares one loop — matching how a real running app only ever has one.
 
 ## Deployment (Railway)
 
