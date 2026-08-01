@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 """Shared pytest fixtures for the API test suite.
 
 NOTE: these fixtures target DATABASE_URL from .env -- the same live Neon
